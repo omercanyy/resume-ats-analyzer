@@ -99,33 +99,48 @@ def call_affinda_with_cache(pdf_bytes, filename):
     
     return res_data
 
-def get_or_classify_taxonomy(all_skill_names):
+def extract_candidate_target_role(base_data, imp_data):
+    """Dynamically extracts the dominant target role from parsed resume work experience or profession."""
+    for d in [imp_data.get("data", {}), base_data.get("data", {})]:
+        work_exp = d.get("workExperience", [])
+        if work_exp and work_exp[0].get("jobTitle"):
+            return work_exp[0].get("jobTitle")
+        if d.get("profession"):
+            return d.get("profession")
+    return "Software Development Engineer"
+
+def get_or_classify_taxonomy(all_skill_names, target_role="Software Development Engineer"):
+    """Loads or generates role-specific skill taxonomy cache using Gemini Flash."""
+    import re
+    role_slug = re.sub(r'[^a-zA-Z0-9]+', '_', target_role.lower()).strip('_')
+    taxonomy_file = CACHE_DIR / f"taxonomy_{role_slug}.json"
+    
     taxonomy = {}
-    if os.path.exists(TAXONOMY_FILE):
-        with open(TAXONOMY_FILE, "r") as f:
+    if taxonomy_file.exists():
+        with open(taxonomy_file, "r") as f:
             taxonomy = json.load(f)
             
     unclassified = [s for s in all_skill_names if s not in taxonomy]
     if not unclassified:
         return taxonomy
         
-    print(f"🤖 Classifying {len(unclassified)} new skills with Gemini 3.6 Flash...")
-    prompt = f"""You are an expert ATS & Technical Recruiting Classifier for Software Development Engineer in Test (SDET) and Backend Software Engineering roles.
+    print(f"🤖 Classifying {len(unclassified)} new skills for target role '{target_role}' via Gemini 3.6 Flash...")
+    prompt = f"""You are an expert ATS & Technical Recruiting Classifier for {target_role} roles.
 
-Classify each of the following raw skill strings extracted by an ATS resume parser into EXACTLY ONE of these four categories:
-1. "HARD_TECH": Specific programming languages, tools, frameworks, databases, cloud infra, CI/CD, test libraries (e.g., Java, Spring Boot, Playwright, Selenium, Kubernetes, REST Assured, Git, PostgreSQL, Docker, AI Agents, JUnit 5, Apache POI, Splunk).
-2. "QA_METHODOLOGY": Industry testing practices, test architecture concepts, and testing types (e.g., BDD, TDD, Root Cause Analysis, Smoke Testing, Performance Testing, Data-Driven Testing, Load Testing, Regression Testing, Framework Design, Test Strategy, Object Model).
-3. "PROCESS_LEADERSHIP": Team leadership, engineering processes, Agile/Scrum events, security operations (e.g., Technical Leadership, Incident Management, Agile Software Development, Scrum, Vulnerability Management, Mentoring, Human-in-the-loop, Triage, Auditing, Hardening, Sprint Planning).
-4. "PARSER_NOISE": Generic resume filler words, non-technical English nouns/verbs, vague phrases, or obvious parser hallucinations (e.g., Source (Game Engine), FourGen Computer-Aided Software Engineering (CASE) Tools, Adoptions, Execution Time, Maintainability, Failure Analysis, Investigation, Table Setting, Collaboration, Social Media, Website Management, Reliability, Test Case, Test Planning, UI Components).
+Classify each of the following raw skill strings extracted by an ATS resume parser into EXACTLY ONE of these four categories based on their relevance and importance to a {target_role}:
+1. "HARD_TECH": Specific programming languages, tools, frameworks, databases, cloud infrastructure, libraries, APIs, and domain-specific hard technical tools relevant to a {target_role}.
+2. "QA_METHODOLOGY": Core engineering practices, architecture patterns, domain methodologies, and design standards (e.g. testing architectures, BDD/TDD, system design, data modeling, framework design, code quality strategies).
+3. "PROCESS_LEADERSHIP": Team leadership, Agile/Scrum processes, cross-functional operations, security/compliance, triage, mentoring, and incident management.
+4. "PARSER_NOISE": Generic resume filler words, conversational non-technical English verbs/nouns, vague phrases, or obvious parser hallucinations/artifacts (e.g. Table Setting, Collaboration, Social Media, Website Management, Adoptions, Execution Time, Reliability, Planning).
 
-Skills:
+Skills to classify:
 {json.dumps(unclassified, indent=2)}
 
 Return ONLY a valid JSON object:
 {{
   "skill_name": {{
     "category": "HARD_TECH" | "QA_METHODOLOGY" | "PROCESS_LEADERSHIP" | "PARSER_NOISE",
-    "reason": "short explanation"
+    "reason": "short explanation in context of a {target_role}"
   }}
 }}
 """
@@ -145,8 +160,9 @@ Return ONLY a valid JSON object:
         for k, v in new_classifications.items():
             taxonomy[k] = v
             
-        with open(TAXONOMY_FILE, "w") as f:
+        with open(taxonomy_file, "w") as f:
             json.dump(taxonomy, f, indent=2)
+        print(f"   💾 Saved adaptive taxonomy to .cache/taxonomy_{role_slug}.json")
     except Exception as e:
         print(f"   ⚠️ Gemini classification notice: {e}. Defaulting new skills to PARSER_NOISE.")
         for s in unclassified:
@@ -164,11 +180,14 @@ def generate_html_report(base_data, imp_data, output_filepath):
     b = base_data.get("data", {})
     i = imp_data.get("data", {})
     
+    target_role = extract_candidate_target_role(base_data, imp_data)
+    print(f"🎯 Target Candidate Role Detected: '{target_role}'")
+    
     b_skills = {s["name"]: s for s in b.get("skills", []) if s.get("name")}
     i_skills = {s["name"]: s for s in i.get("skills", []) if s.get("name")}
     all_skill_names = sorted(list(set(b_skills.keys()).union(set(i_skills.keys()))))
     
-    taxonomy = get_or_classify_taxonomy(all_skill_names)
+    taxonomy = get_or_classify_taxonomy(all_skill_names, target_role=target_role)
     
     less_rep = []
     more_rep = []
@@ -491,7 +510,7 @@ def generate_html_report(base_data, imp_data, output_filepath):
   <header>
     <div>
       <h1>Affinda ATS Resume Comparison & Signal Dashboard</h1>
-      <div class="subtitle">Relative ATS Point Delta: (Improved - Baseline) / Baseline (Affinda US1 + Gemini Flash)</div>
+      <div class="subtitle">Target Role: <strong>{target_role}</strong> | Relative ATS Delta: (Improved - Baseline) / Baseline</div>
     </div>
     <div style="display: flex; gap: 8px;">
       <button class="filter-btn" onclick="resetIgnoredSkills()" title="Reset all ignored checkboxes">↺ Reset Ignored</button>
