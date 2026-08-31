@@ -99,17 +99,17 @@ def call_affinda_with_cache(pdf_bytes, filename):
     
     return res_data
 
-def extract_candidate_target_role(base_data, imp_data):
-    """Dynamically extracts the dominant target role from parsed resume work experience or profession."""
-    for d in [imp_data.get("data", {}), base_data.get("data", {})]:
-        work_exp = d.get("workExperience", [])
-        if work_exp and work_exp[0].get("jobTitle"):
-            return work_exp[0].get("jobTitle")
-        if d.get("profession"):
-            return d.get("profession")
-    return "Software Development Engineer"
+def extract_resume_target_role(doc_data, fallback_name="Software Development Engineer"):
+    """Extracts target role from parsed resume work experience or profession."""
+    d = doc_data.get("data", {})
+    work_exp = d.get("workExperience", [])
+    if work_exp and work_exp[0].get("jobTitle"):
+        return work_exp[0].get("jobTitle")
+    if d.get("profession"):
+        return d.get("profession")
+    return fallback_name
 
-def get_or_classify_taxonomy(all_skill_names, target_role="Software Development Engineer"):
+def get_or_classify_taxonomy(skill_names, target_role="Software Development Engineer"):
     """Loads or generates role-specific skill taxonomy cache using Gemini Flash."""
     import re
     role_slug = re.sub(r'[^a-zA-Z0-9]+', '_', target_role.lower()).strip('_')
@@ -120,7 +120,7 @@ def get_or_classify_taxonomy(all_skill_names, target_role="Software Development 
         with open(taxonomy_file, "r") as f:
             taxonomy = json.load(f)
             
-    unclassified = [s for s in all_skill_names if s not in taxonomy]
+    unclassified = [s for s in skill_names if s not in taxonomy]
     if not unclassified:
         return taxonomy
         
@@ -180,14 +180,18 @@ def generate_html_report(base_data, imp_data, output_filepath):
     b = base_data.get("data", {})
     i = imp_data.get("data", {})
     
-    target_role = extract_candidate_target_role(base_data, imp_data)
-    print(f"🎯 Target Candidate Role Detected: '{target_role}'")
+    b_role = extract_resume_target_role(base_data, "Baseline Role")
+    i_role = extract_resume_target_role(imp_data, "Improved Role")
+    print(f"🎯 Baseline Resume Target Role: '{b_role}'")
+    print(f"🎯 Improved Resume Target Role: '{i_role}'")
     
     b_skills = {s["name"]: s for s in b.get("skills", []) if s.get("name")}
     i_skills = {s["name"]: s for s in i.get("skills", []) if s.get("name")}
     all_skill_names = sorted(list(set(b_skills.keys()).union(set(i_skills.keys()))))
     
-    taxonomy = get_or_classify_taxonomy(all_skill_names, target_role=target_role)
+    # Classify against respective role taxonomies
+    base_taxonomy = get_or_classify_taxonomy(list(b_skills.keys()), target_role=b_role)
+    imp_taxonomy = get_or_classify_taxonomy(list(i_skills.keys()), target_role=i_role)
     
     less_rep = []
     more_rep = []
@@ -207,10 +211,18 @@ def generate_html_report(base_data, imp_data, output_filepath):
         bs = b_skills.get(name, {})
         is_ = i_skills.get(name, {})
         
-        tax_info = taxonomy.get(name, {})
-        cat = tax_info.get("category", "PARSER_NOISE")
-        reason = tax_info.get("reason", "")
-        weight = CATEGORY_WEIGHTS.get(cat, 0.0)
+        b_tax = base_taxonomy.get(name, {}) if in_b else {}
+        i_tax = imp_taxonomy.get(name, {}) if in_i else {}
+        
+        b_cat = b_tax.get("category", "PARSER_NOISE")
+        i_cat = i_tax.get("category", "PARSER_NOISE")
+        
+        b_weight = CATEGORY_WEIGHTS.get(b_cat, 0.0)
+        i_weight = CATEGORY_WEIGHTS.get(i_cat, 0.0)
+        
+        # Primary category & reason for row rendering
+        display_cat = i_cat if in_i else b_cat
+        display_reason = i_tax.get("reason") if in_i else b_tax.get("reason", "")
         
         b_months = bs.get("numberOfMonths")
         i_months = is_.get("numberOfMonths")
@@ -222,9 +234,12 @@ def generate_html_report(base_data, imp_data, output_filepath):
         
         row_data = {
             "name": name,
-            "category": cat,
-            "reason": reason,
-            "weight": weight,
+            "category": display_cat,
+            "reason": display_reason,
+            "b_cat": b_cat,
+            "i_cat": i_cat,
+            "b_weight": b_weight,
+            "i_weight": i_weight,
             "in_b": in_b,
             "in_i": in_i,
             "b_months": b_months,
@@ -235,23 +250,23 @@ def generate_html_report(base_data, imp_data, output_filepath):
             "imp_last": i_last
         }
         
-        if cat == "PARSER_NOISE":
+        is_noise = (display_cat == "PARSER_NOISE")
+        if is_noise:
             noise_items.append(row_data)
         else:
-            if in_b:
-                cat_pts["ALL"]["b"] += weight
+            if in_b and b_cat != "PARSER_NOISE":
+                cat_pts["ALL"]["b"] += b_weight
                 cat_pts["ALL"]["b_cnt"] += 1
-            if in_i:
-                cat_pts["ALL"]["i"] += weight
+                if b_cat in cat_pts:
+                    cat_pts[b_cat]["b"] += b_weight
+                    cat_pts[b_cat]["b_cnt"] += 1
+                    
+            if in_i and i_cat != "PARSER_NOISE":
+                cat_pts["ALL"]["i"] += i_weight
                 cat_pts["ALL"]["i_cnt"] += 1
-                
-            if cat in cat_pts:
-                if in_b:
-                    cat_pts[cat]["b"] += weight
-                    cat_pts[cat]["b_cnt"] += 1
-                if in_i:
-                    cat_pts[cat]["i"] += weight
-                    cat_pts[cat]["i_cnt"] += 1
+                if i_cat in cat_pts:
+                    cat_pts[i_cat]["i"] += i_weight
+                    cat_pts[i_cat]["i_cnt"] += 1
             
             b_val = (b_months or 0.5) if in_b else 0.0
             i_val = (i_months or 0.5) if in_i else 0.0
@@ -325,7 +340,10 @@ def generate_html_report(base_data, imp_data, output_filepath):
             rows.append(f"""<tr class="skill-row {'noise-row' if is_noise else ''}" 
                 data-name="{r['name'].lower()}" 
                 data-cat="{r['category']}" 
-                data-weight="{r['weight']}"
+                data-b-cat="{r['b_cat']}"
+                data-i-cat="{r['i_cat']}"
+                data-b-weight="{r['b_weight']}"
+                data-i-weight="{r['i_weight']}"
                 data-in-b="{'1' if r['in_b'] else '0'}"
                 data-in-i="{'1' if r['in_i'] else '0'}">
               <td style="width: 40px; text-align: center;">
@@ -339,6 +357,8 @@ def generate_html_report(base_data, imp_data, output_filepath):
               <td style="font-size: 0.8rem; color: var(--text-secondary);">{r['reason']}</td>
             </tr>""")
         return "".join(rows)
+
+    role_display = f"Target Role: <strong>{b_role}</strong>" if b_role == i_role else f"Baseline: <strong>{b_role}</strong> vs. Improved: <strong>{i_role}</strong>"
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -510,7 +530,7 @@ def generate_html_report(base_data, imp_data, output_filepath):
   <header>
     <div>
       <h1>Affinda ATS Resume Comparison & Signal Dashboard</h1>
-      <div class="subtitle">Target Role: <strong>{target_role}</strong> | Relative ATS Delta: (Improved - Baseline) / Baseline</div>
+      <div class="subtitle">{role_display} | Relative ATS Delta: (Improved - Baseline) / Baseline</div>
     </div>
     <div style="display: flex; gap: 8px;">
       <button class="filter-btn" onclick="resetIgnoredSkills()" title="Reset all ignored checkboxes">↺ Reset Ignored</button>
@@ -902,6 +922,10 @@ function recalculateDelta() {{
   
   document.querySelectorAll('.skill-row').forEach(row => {{
     const cat = row.getAttribute('data-cat');
+    const bCat = row.getAttribute('data-b-cat');
+    const iCat = row.getAttribute('data-i-cat');
+    const bWeight = parseFloat(row.getAttribute('data-b-weight') || '0');
+    const iWeight = parseFloat(row.getAttribute('data-i-weight') || '0');
     const chk = row.querySelector('.ignore-checkbox');
     const inB = row.getAttribute('data-in-b') === '1';
     const inI = row.getAttribute('data-in-i') === '1';
@@ -910,14 +934,15 @@ function recalculateDelta() {{
       if (inB) noiseStats.b_cnt++;
       if (inI) noiseStats.i_cnt++;
     }} else if (!chk.checked) {{
-      const weight = CAT_WEIGHTS[cat] || 1.0;
-      
-      if (inB) {{ stats['ALL'].b_pts += weight; stats['ALL'].b_cnt++; }}
-      if (inI) {{ stats['ALL'].i_pts += weight; stats['ALL'].i_cnt++; }}
-      
-      if (stats[cat]) {{
-        if (inB) {{ stats[cat].b_pts += weight; stats[cat].b_cnt++; }}
-        if (inI) {{ stats[cat].i_pts += weight; stats[cat].i_cnt++; }}
+      if (inB && bCat !== 'PARSER_NOISE') {{
+        stats['ALL'].b_pts += bWeight;
+        stats['ALL'].b_cnt++;
+        if (stats[bCat]) {{ stats[bCat].b_pts += bWeight; stats[bCat].b_cnt++; }}
+      }}
+      if (inI && iCat !== 'PARSER_NOISE') {{
+        stats['ALL'].i_pts += iWeight;
+        stats['ALL'].i_cnt++;
+        if (stats[iCat]) {{ stats[iCat].i_pts += iWeight; stats[iCat].i_cnt++; }}
       }}
     }}
   }});
