@@ -29,7 +29,6 @@ except Exception:
 BASE_URL = "https://api.us1.affinda.com/v3"
 COLLECTION_ID = "sVbXvfpU"
 CACHE_DIR = get_cache_dir()
-TAXONOMY_FILE = PROJECT_ROOT / "sdet_skill_taxonomy.json"
 
 DOCS = {
     "baseline": {
@@ -44,7 +43,21 @@ DOCS = {
     }
 }
 
-def fetch_pdf_bytes(doc_id):
+def parse_doc_id(id_or_url):
+    """Extract Google Doc/Drive ID from a URL or return as-is if already an ID."""
+    import re
+    # Match: /d/{id}/ or /d/{id} at end, or ?id={id}
+    m = re.search(r'/d/([a-zA-Z0-9_-]+)', id_or_url)
+    if m:
+        return m.group(1)
+    m = re.search(r'[?&]id=([a-zA-Z0-9_-]+)', id_or_url)
+    if m:
+        return m.group(1)
+    # Assume it's already a raw ID
+    return id_or_url.strip()
+
+def fetch_pdf_bytes(doc_id_or_url):
+    doc_id = parse_doc_id(doc_id_or_url)
     url = f"https://docs.google.com/document/d/{doc_id}/export?format=pdf"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, context=SSL_CONTEXT) as resp:
@@ -109,8 +122,83 @@ def extract_resume_target_role(doc_data, fallback_name="Software Development Eng
         return d.get("profession")
     return fallback_name
 
-def get_or_classify_taxonomy(skill_names, target_role="Software Development Engineer"):
-    """Loads or generates role-specific skill taxonomy cache using Gemini Flash."""
+def get_or_generate_taxonomy_definition(target_role):
+    """Step 1: Generate role-specific taxonomy categories via Gemini. Cached per role."""
+    import re
+    role_slug = re.sub(r'[^a-zA-Z0-9]+', '_', target_role.lower()).strip('_')
+    def_file = CACHE_DIR / f"taxonomy_def_{role_slug}.json"
+    
+    if def_file.exists():
+        with open(def_file, "r") as f:
+            return json.load(f)
+    
+    print(f"🧠 Step 1: Generating taxonomy categories for '{target_role}' via Gemini...")
+    prompt = f"""You are an expert ATS (Applicant Tracking System) and Technical Recruiting specialist.
+
+For the role of "{target_role}", generate the skill taxonomy categories that an ATS system would use to evaluate resumes for this role.
+
+For each category, provide:
+- A short machine-readable ID (UPPER_SNAKE_CASE)
+- A human-readable name
+- A description of what skills belong in this category
+- A weight (1-5) representing how important this category is for ATS scoring for this specific role
+- 5-8 example skills that belong in this category
+
+Also include a "PARSER_NOISE" category for non-technical filler words and parser artifacts, with weight 0.
+
+Return ONLY a valid JSON object:
+{{
+  "role": "{target_role}",
+  "categories": [
+    {{
+      "id": "CATEGORY_ID",
+      "name": "Human Readable Name",
+      "description": "What belongs here",
+      "weight": 4,
+      "examples": ["Skill1", "Skill2"]
+    }}
+  ]
+}}
+"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.0, "seed": 42}
+    }
+    
+    try:
+        req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, context=SSL_CONTEXT, timeout=120) as resp:
+            res_data = json.loads(resp.read().decode('utf-8'))
+            text_content = res_data["candidates"][0]["content"]["parts"][0]["text"]
+            taxonomy_def = json.loads(text_content)
+        
+        with open(def_file, "w") as f:
+            json.dump(taxonomy_def, f, indent=2)
+        
+        cats = taxonomy_def.get("categories", [])
+        for c in cats:
+            print(f"   • {c['id']} (weight={c['weight']}): {c['name']}")
+        print(f"   💾 Saved taxonomy definition to .cache/taxonomy_def_{role_slug}.json")
+        return taxonomy_def
+    except Exception as e:
+        print(f"   ⚠️ Taxonomy generation error: {e}. Using fallback categories.")
+        fallback = {
+            "role": target_role,
+            "categories": [
+                {"id": "TECHNICAL_SKILLS", "name": "Technical Skills", "description": "All technical skills", "weight": 4, "examples": []},
+                {"id": "METHODOLOGY", "name": "Methodology & Practices", "description": "Methodologies and practices", "weight": 3, "examples": []},
+                {"id": "LEADERSHIP", "name": "Leadership & Process", "description": "Leadership and process skills", "weight": 2, "examples": []},
+                {"id": "PARSER_NOISE", "name": "Parser Noise", "description": "Non-technical filler", "weight": 0, "examples": []}
+            ]
+        }
+        with open(def_file, "w") as f:
+            json.dump(fallback, f, indent=2)
+        return fallback
+
+
+def get_or_classify_taxonomy(skill_names, target_role, taxonomy_def):
+    """Step 2: Classify skills into taxonomy categories. Incremental cache per role."""
     import re
     role_slug = re.sub(r'[^a-zA-Z0-9]+', '_', target_role.lower()).strip('_')
     taxonomy_file = CACHE_DIR / f"taxonomy_{role_slug}.json"
@@ -123,15 +211,23 @@ def get_or_classify_taxonomy(skill_names, target_role="Software Development Engi
     unclassified = [s for s in skill_names if s not in taxonomy]
     if not unclassified:
         return taxonomy
-        
-    print(f"🤖 Classifying {len(unclassified)} new skills for target role '{target_role}' via Gemini 3.6 Flash...")
+    
+    # Build category context from taxonomy definition
+    categories = taxonomy_def.get("categories", [])
+    cat_descriptions = "\n".join([
+        f'- "{c["id"]}": {c["name"]} — {c["description"]}. Examples: {", ".join(c.get("examples", []))}'
+        for c in categories
+    ])
+    valid_ids = [c["id"] for c in categories]
+    
+    print(f"🤖 Step 2: Classifying {len(unclassified)} skills for '{target_role}' via Gemini...")
     prompt = f"""You are an expert ATS & Technical Recruiting Classifier for {target_role} roles.
 
-Classify each of the following raw skill strings extracted by an ATS resume parser into EXACTLY ONE of these four categories based on their relevance and importance to a {target_role}:
-1. "HARD_TECH": Specific programming languages, tools, frameworks, databases, cloud infrastructure, libraries, APIs, and domain-specific hard technical tools relevant to a {target_role}.
-2. "QA_METHODOLOGY": Core engineering practices, architecture patterns, domain methodologies, and design standards (e.g. testing architectures, BDD/TDD, system design, data modeling, framework design, code quality strategies).
-3. "PROCESS_LEADERSHIP": Team leadership, Agile/Scrum processes, cross-functional operations, security/compliance, triage, mentoring, and incident management.
-4. "PARSER_NOISE": Generic resume filler words, conversational non-technical English verbs/nouns, vague phrases, or obvious parser hallucinations/artifacts (e.g. Table Setting, Collaboration, Social Media, Website Management, Adoptions, Execution Time, Reliability, Planning).
+The following taxonomy categories have been defined for this role:
+{cat_descriptions}
+
+Classify each of the following raw skill strings into EXACTLY ONE of the categories listed above.
+If a skill does not clearly belong to any technical category, classify it as "PARSER_NOISE".
 
 Skills to classify:
 {json.dumps(unclassified, indent=2)}
@@ -139,42 +235,39 @@ Skills to classify:
 Return ONLY a valid JSON object:
 {{
   "skill_name": {{
-    "category": "HARD_TECH" | "QA_METHODOLOGY" | "PROCESS_LEADERSHIP" | "PARSER_NOISE",
-    "reason": "short explanation in context of a {target_role}"
+    "category": "CATEGORY_ID",
+    "reason": "short explanation"
   }}
 }}
 """
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1}
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.0, "seed": 42}
     }
     
     try:
         req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, context=SSL_CONTEXT) as resp:
+        with urllib.request.urlopen(req, context=SSL_CONTEXT, timeout=120) as resp:
             res_data = json.loads(resp.read().decode('utf-8'))
             text_content = res_data["candidates"][0]["content"]["parts"][0]["text"]
             new_classifications = json.loads(text_content)
             
+        # Validate categories — if Gemini returns an unknown category, map to PARSER_NOISE
         for k, v in new_classifications.items():
+            if v.get("category") not in valid_ids:
+                v["category"] = "PARSER_NOISE"
+                v["reason"] = f"Category '{v.get('category')}' not in taxonomy; defaulted to PARSER_NOISE"
             taxonomy[k] = v
             
         with open(taxonomy_file, "w") as f:
             json.dump(taxonomy, f, indent=2)
-        print(f"   💾 Saved adaptive taxonomy to .cache/taxonomy_{role_slug}.json")
+        print(f"   💾 Saved {len(new_classifications)} classifications to .cache/taxonomy_{role_slug}.json")
     except Exception as e:
         print(f"   ⚠️ Gemini classification notice: {e}. Defaulting new skills to PARSER_NOISE.")
         for s in unclassified:
             taxonomy[s] = {"category": "PARSER_NOISE", "reason": "Unclassified fallback"}
     return taxonomy
-
-CATEGORY_WEIGHTS = {
-    "HARD_TECH": 4.0,           # Hard tech, tools, frameworks, languages
-    "QA_METHODOLOGY": 3.0,      # Testing practices, architecture, test types
-    "PROCESS_LEADERSHIP": 2.0,  # Leadership, SDLC, triage, incident management
-    "PARSER_NOISE": 0.0         # Quarantined noise
-}
 
 def generate_html_report(base_data, imp_data, output_filepath):
     b = base_data.get("data", {})
@@ -185,25 +278,46 @@ def generate_html_report(base_data, imp_data, output_filepath):
     print(f"🎯 Baseline Resume Target Role: '{b_role}'")
     print(f"🎯 Improved Resume Target Role: '{i_role}'")
     
+    # Step 1: Generate taxonomy definitions
+    b_tax_def = get_or_generate_taxonomy_definition(b_role)
+    i_tax_def = b_tax_def if b_role == i_role else get_or_generate_taxonomy_definition(i_role)
+    
     b_skills = {s["name"]: s for s in b.get("skills", []) if s.get("name")}
     i_skills = {s["name"]: s for s in i.get("skills", []) if s.get("name")}
     all_skill_names = sorted(list(set(b_skills.keys()).union(set(i_skills.keys()))))
     
-    # Classify against respective role taxonomies
-    base_taxonomy = get_or_classify_taxonomy(list(b_skills.keys()), target_role=b_role)
-    imp_taxonomy = get_or_classify_taxonomy(list(i_skills.keys()), target_role=i_role)
+    # Step 2: Classify skills into taxonomy categories
+    base_taxonomy = get_or_classify_taxonomy(list(b_skills.keys()), target_role=b_role, taxonomy_def=b_tax_def)
+    imp_taxonomy = get_or_classify_taxonomy(list(i_skills.keys()), target_role=i_role, taxonomy_def=i_tax_def)
+    
+    # Build weight lookups from taxonomy definitions
+    b_weights = {c["id"]: float(c["weight"]) for c in b_tax_def.get("categories", [])}
+    i_weights = {c["id"]: float(c["weight"]) for c in i_tax_def.get("categories", [])}
+    
+    # Build union of all non-noise categories across both taxonomies
+    b_cat_info = {c["id"]: c for c in b_tax_def.get("categories", []) if c["id"] != "PARSER_NOISE"}
+    i_cat_info = {c["id"]: c for c in i_tax_def.get("categories", []) if c["id"] != "PARSER_NOISE"}
+    union_cat_ids = sorted(set(b_cat_info.keys()) | set(i_cat_info.keys()),
+                           key=lambda cid: max(b_weights.get(cid, 0), i_weights.get(cid, 0)),
+                           reverse=True)
+    # Merge category metadata (prefer the one with higher weight)
+    union_cat_meta = {}
+    for cid in union_cat_ids:
+        if cid in b_cat_info and cid in i_cat_info:
+            union_cat_meta[cid] = b_cat_info[cid] if b_weights.get(cid, 0) >= i_weights.get(cid, 0) else i_cat_info[cid]
+        elif cid in b_cat_info:
+            union_cat_meta[cid] = b_cat_info[cid]
+        else:
+            union_cat_meta[cid] = i_cat_info[cid]
     
     less_rep = []
     more_rep = []
     other_rep = []
     noise_items = []
     
-    cat_pts = {
-        "ALL": {"b": 0.0, "i": 0.0, "b_cnt": 0, "i_cnt": 0},
-        "HARD_TECH": {"b": 0.0, "i": 0.0, "b_cnt": 0, "i_cnt": 0},
-        "QA_METHODOLOGY": {"b": 0.0, "i": 0.0, "b_cnt": 0, "i_cnt": 0},
-        "PROCESS_LEADERSHIP": {"b": 0.0, "i": 0.0, "b_cnt": 0, "i_cnt": 0}
-    }
+    cat_pts = {"ALL": {"b": 0.0, "i": 0.0, "b_cnt": 0, "i_cnt": 0}}
+    for cid in union_cat_ids:
+        cat_pts[cid] = {"b": 0.0, "i": 0.0, "b_cnt": 0, "i_cnt": 0}
     
     for name in all_skill_names:
         in_b = name in b_skills
@@ -217,8 +331,8 @@ def generate_html_report(base_data, imp_data, output_filepath):
         b_cat = b_tax.get("category", "PARSER_NOISE")
         i_cat = i_tax.get("category", "PARSER_NOISE")
         
-        b_weight = CATEGORY_WEIGHTS.get(b_cat, 0.0)
-        i_weight = CATEGORY_WEIGHTS.get(i_cat, 0.0)
+        b_weight = b_weights.get(b_cat, 0.0)
+        i_weight = i_weights.get(i_cat, 0.0)
         
         # Primary category & reason for row rendering
         display_cat = i_cat if in_i else b_cat
@@ -293,9 +407,6 @@ def generate_html_report(base_data, imp_data, output_filepath):
         return ((i_val - b_val) / b_val) * 100.0
         
     all_delta_pct = calc_delta_pct(cat_pts["ALL"]["b"], cat_pts["ALL"]["i"])
-    hard_delta_pct = calc_delta_pct(cat_pts["HARD_TECH"]["b"], cat_pts["HARD_TECH"]["i"])
-    qa_delta_pct = calc_delta_pct(cat_pts["QA_METHODOLOGY"]["b"], cat_pts["QA_METHODOLOGY"]["i"])
-    proc_delta_pct = calc_delta_pct(cat_pts["PROCESS_LEADERSHIP"]["b"], cat_pts["PROCESS_LEADERSHIP"]["i"])
 
     b_noise_cnt = sum(1 for r in noise_items if r['in_b'])
     i_noise_cnt = sum(1 for r in noise_items if r['in_i'])
@@ -305,18 +416,20 @@ def generate_html_report(base_data, imp_data, output_filepath):
     print("📊 ATS POINT AUDIT LOG & BREAKDOWN:")
     print("=" * 80)
     print(f"BASELINE RESUME (Total: {cat_pts['ALL']['b']:.0f} pts):")
-    print(f"  • Hard Tech & Tools:     {cat_pts['HARD_TECH']['b_cnt']:2d} skills × 4 pts = {cat_pts['HARD_TECH']['b']:.0f} pts")
-    print(f"  • QA Methodologies:      {cat_pts['QA_METHODOLOGY']['b_cnt']:2d} skills × 3 pts = {cat_pts['QA_METHODOLOGY']['b']:.0f} pts")
-    print(f"  • Process & Leadership:  {cat_pts['PROCESS_LEADERSHIP']['b_cnt']:2d} skills × 2 pts = {cat_pts['PROCESS_LEADERSHIP']['b']:.0f} pts")
-    print(f"  • Filtered Noise:        {b_noise_cnt:2d} artifacts")
+    for cid in union_cat_ids:
+        meta = union_cat_meta[cid]
+        w = b_weights.get(cid, 0)
+        print(f"  • {meta['name']:40s} {cat_pts[cid]['b_cnt']:2d} skills × {w:.0f} pts = {cat_pts[cid]['b']:.0f} pts")
+    print(f"  • {'Filtered Noise':40s} {b_noise_cnt:2d} artifacts")
     print(f"  -------------------------------------------------------------")
     print(f"  TOTAL BASELINE POINTS  = {cat_pts['ALL']['b']:.0f} pts")
     print()
     print(f"IMPROVED RESUME (Total: {cat_pts['ALL']['i']:.0f} pts):")
-    print(f"  • Hard Tech & Tools:     {cat_pts['HARD_TECH']['i_cnt']:2d} skills × 4 pts = {cat_pts['HARD_TECH']['i']:.0f} pts")
-    print(f"  • QA Methodologies:      {cat_pts['QA_METHODOLOGY']['i_cnt']:2d} skills × 3 pts = {cat_pts['QA_METHODOLOGY']['i']:.0f} pts")
-    print(f"  • Process & Leadership:  {cat_pts['PROCESS_LEADERSHIP']['i_cnt']:2d} skills × 2 pts = {cat_pts['PROCESS_LEADERSHIP']['i']:.0f} pts")
-    print(f"  • Filtered Noise:        {i_noise_cnt:2d} artifacts ({noise_delta_pct:+.1f}% noise reduction)")
+    for cid in union_cat_ids:
+        meta = union_cat_meta[cid]
+        w = i_weights.get(cid, 0)
+        print(f"  • {meta['name']:40s} {cat_pts[cid]['i_cnt']:2d} skills × {w:.0f} pts = {cat_pts[cid]['i']:.0f} pts")
+    print(f"  • {'Filtered Noise':40s} {i_noise_cnt:2d} artifacts ({noise_delta_pct:+.1f}% noise reduction)")
     print(f"  -------------------------------------------------------------")
     print(f"  TOTAL IMPROVED POINTS  = {cat_pts['ALL']['i']:.0f} pts")
     print(f"  NET SCORE DELTA:         {all_delta_pct:+.1f}% ((Improved - Baseline) / Baseline)")
@@ -325,12 +438,7 @@ def generate_html_report(base_data, imp_data, output_filepath):
     def render_table_rows(items, is_noise=False):
         rows = []
         for r in items:
-            cat_badge_class = {
-                "HARD_TECH": "badge-hard",
-                "QA_METHODOLOGY": "badge-qa",
-                "PROCESS_LEADERSHIP": "badge-proc",
-                "PARSER_NOISE": "badge-noise"
-            }.get(r["category"], "badge-noise")
+            cat_badge_class = cat_badge_map.get(r["category"], "badge-noise")
             
             b_val = (r["b_months"] or 0.5) if r["in_b"] else 0.0
             i_val = (r["i_months"] or 0.5) if r["in_i"] else 0.0
@@ -359,6 +467,54 @@ def generate_html_report(base_data, imp_data, output_filepath):
         return "".join(rows)
 
     role_display = f"Target Role: <strong>{b_role}</strong>" if b_role == i_role else f"Baseline: <strong>{b_role}</strong> vs. Improved: <strong>{i_role}</strong>"
+
+    # Pre-compute dynamic KPI cards HTML
+    kpi_cards_html = ""
+    for cid in union_cat_ids:
+        d = calc_delta_pct(cat_pts[cid]["b"], cat_pts[cid]["i"])
+        color = "var(--green)" if d >= 0 else "var(--red)"
+        kpi_cards_html += f"""
+    <div class="kpi-card">
+      <div class="kpi-title">{union_cat_meta[cid]['name']} Delta</div>
+      <div class="kpi-value" style="color: {color};">
+        <span id="kpi-{cid.lower()}-val">{d:+.1f}%</span>
+      </div>
+      <div style="font-size: 0.75rem; color: var(--text-secondary); margin-top: 4px;" id="kpi-{cid.lower()}-sub">
+        Baseline: {cat_pts[cid]['b_cnt']} skills → Improved: {cat_pts[cid]['i_cnt']} skills
+      </div>
+    </div>
+    """
+
+    # Pre-compute dynamic filter buttons HTML
+    filter_buttons_html = ""
+    for cid in union_cat_ids:
+        d = calc_delta_pct(cat_pts[cid]["b"], cat_pts[cid]["i"])
+        color = "var(--green)" if d >= 0 else "var(--red)"
+        filter_buttons_html += f'<button class="filter-btn" onclick="filterCategory(\'{cid}\', this)">{union_cat_meta[cid]["name"]} <span style="color: {color}; font-weight: 700;">{d:+.1f}%</span></button>'
+
+    # Pre-compute CAT_WEIGHTS JSON for JS
+    cat_weights_json = json.dumps({c["id"]: float(c["weight"]) for c in b_tax_def.get("categories", [])})
+
+    # Pre-compute badge colors for each category
+    badge_colors = [
+        "#38bdf8",  # sky blue
+        "#22c55e",  # green
+        "#c084fc",  # purple
+        "#f59e0b",  # amber
+        "#ec4899",  # pink
+        "#14b8a6",  # teal
+        "#f97316",  # orange
+        "#6366f1",  # indigo
+        "#84cc16",  # lime
+        "#06b6d4",  # cyan
+    ]
+    cat_badge_map = {"PARSER_NOISE": "badge-noise"}
+    badge_css_rules = "  .badge-noise {{ border-color: #ef4444; color: #ef4444; }}\n"
+    for idx, cid in enumerate(union_cat_ids):
+        cls = f"badge-cat-{idx}"
+        cat_badge_map[cid] = cls
+        color = badge_colors[idx % len(badge_colors)]
+        badge_css_rules += f"  .{cls} {{ border-color: {color}; color: {color}; }}\n"
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -476,10 +632,7 @@ def generate_html_report(base_data, imp_data, output_filepath):
     border: 1px solid var(--border);
     white-space: nowrap;
   }}
-  .badge-hard {{ border-color: #38bdf8; color: #38bdf8; }}
-  .badge-qa {{ border-color: #22c55e; color: #22c55e; }}
-  .badge-proc {{ border-color: #c084fc; color: #c084fc; }}
-  .badge-noise {{ border-color: #ef4444; color: #ef4444; }}
+  {badge_css_rules}
   
   .controls-bar {{
     display: flex;
@@ -550,35 +703,8 @@ def generate_html_report(base_data, imp_data, output_filepath):
       </div>
     </div>
 
-    <div class="kpi-card">
-      <div class="kpi-title">Hard Tech & Tools Delta</div>
-      <div class="kpi-value" style="color: {'var(--green)' if hard_delta_pct >= 0 else 'var(--red)'};">
-        <span id="kpi-hard-val">{hard_delta_pct:+.1f}%</span>
-      </div>
-      <div style="font-size: 0.75rem; color: var(--text-secondary); margin-top: 4px;" id="kpi-hard-sub">
-        Baseline: {cat_pts['HARD_TECH']['b_cnt']} tools → Improved: {cat_pts['HARD_TECH']['i_cnt']} tools
-      </div>
-    </div>
+    {kpi_cards_html}
 
-    <div class="kpi-card">
-      <div class="kpi-title">QA Methodologies Delta</div>
-      <div class="kpi-value" style="color: {'var(--green)' if qa_delta_pct >= 0 else 'var(--red)'};">
-        <span id="kpi-qa-val">{qa_delta_pct:+.1f}%</span>
-      </div>
-      <div style="font-size: 0.75rem; color: var(--text-secondary); margin-top: 4px;" id="kpi-qa-sub">
-        Baseline: {cat_pts['QA_METHODOLOGY']['b_cnt']} practices → Improved: {cat_pts['QA_METHODOLOGY']['i_cnt']} practices
-      </div>
-    </div>
-
-    <div class="kpi-card">
-      <div class="kpi-title">Process & Leadership Delta</div>
-      <div class="kpi-value" style="color: {'var(--green)' if proc_delta_pct >= 0 else 'var(--red)'};">
-        <span id="kpi-proc-val">{proc_delta_pct:+.1f}%</span>
-      </div>
-      <div style="font-size: 0.75rem; color: var(--text-secondary); margin-top: 4px;" id="kpi-proc-sub">
-        Baseline: {cat_pts['PROCESS_LEADERSHIP']['b_cnt']} skills → Improved: {cat_pts['PROCESS_LEADERSHIP']['i_cnt']} skills
-      </div>
-    </div>
 
     <div class="kpi-card">
       <div class="kpi-title">Filtered Noise Keywords</div>
@@ -711,11 +837,9 @@ def generate_html_report(base_data, imp_data, output_filepath):
   <div class="controls-bar">
     <div class="filter-group">
       <span style="font-size: 0.8rem; color: var(--text-secondary); font-weight: 600;">FILTER CATEGORY:</span>
-      <button class="filter-btn active" onclick="filterCategory('ALL_SIGNAL', this)">All Signal Skills ({len(all_skill_names) - len(noise_items)})</button>
-      <button class="filter-btn" onclick="filterCategory('HARD_TECH', this)">Hard Tech & Tools</button>
-      <button class="filter-btn" onclick="filterCategory('QA_METHODOLOGY', this)">QA Methodologies</button>
-      <button class="filter-btn" onclick="filterCategory('PROCESS_LEADERSHIP', this)">Process & Leadership</button>
-      <button class="filter-btn" onclick="filterCategory('PARSER_NOISE', this)" style="border-color: rgba(239,68,68,0.4);">Filtered Noise ({len(noise_items)})</button>
+      <button class="filter-btn active" onclick="filterCategory('ALL_SIGNAL', this)">All Signal Skills ({len(all_skill_names) - len(noise_items)}) <span style="color: {'var(--green)' if all_delta_pct >= 0 else 'var(--red)'}; font-weight: 700;">{all_delta_pct:+.1f}%</span></button>
+      {filter_buttons_html}
+      <button class="filter-btn" onclick="filterCategory('PARSER_NOISE', this)" style="border-color: rgba(239,68,68,0.4);">Filtered Noise ({len(noise_items)}) <span style="color: {'var(--green)' if noise_delta_pct <= 0 else 'var(--red)'}; font-weight: 700;">{noise_delta_pct:+.1f}%</span></button>
     </div>
     <div>
       <input type="text" class="search-input" id="skillSearch" placeholder="Search skill name..." onkeyup="filterSkillSearch()">
@@ -843,34 +967,25 @@ def generate_html_report(base_data, imp_data, output_filepath):
 let currentCategory = 'ALL_SIGNAL';
 let currentSearchText = '';
 let ignoredSkills = new Set();
+const CAT_WEIGHTS = {cat_weights_json};
 
-const CAT_WEIGHTS = {{
-  'HARD_TECH': 4.0,
-  'QA_METHODOLOGY': 3.0,
-  'PROCESS_LEADERSHIP': 2.0
-}};
 
 function initIgnoredSkills() {{
-  const saved = localStorage.getItem('affinda_ignored_skills');
+  const saved = localStorage.getItem('ats_ignored_skills');
   if (saved) {{
-    try {{
-      const arr = JSON.parse(saved);
-      arr.forEach(s => ignoredSkills.add(s));
-    }} catch(e) {{}}
+    ignoredSkills = new Set(JSON.parse(saved));
   }}
-  
   document.querySelectorAll('.skill-row').forEach(row => {{
-    const name = row.querySelector('td:nth-child(2)').innerText.trim();
+    const name = row.getAttribute('data-name');
     const chk = row.querySelector('.ignore-checkbox');
     if (ignoredSkills.has(name)) {{
       chk.checked = true;
       row.classList.add('ignored');
-    }} else if (!row.classList.contains('noise-row')) {{
-      chk.checked = false;
-      row.classList.remove('ignored');
+    }} else if (row.classList.contains('noise-row')) {{
+      chk.checked = true;
+      row.classList.add('ignored');
     }}
   }});
-  
   recalculateDelta();
   applyFilters();
 }}
@@ -881,22 +996,23 @@ function toggleSection(headerEl) {{
   contentEl.classList.toggle('open');
 }}
 
-function toggleIgnoreSkill(skillName, checkboxEl) {{
-  const row = checkboxEl.closest('tr');
-  if (checkboxEl.checked) {{
-    ignoredSkills.add(skillName);
+function toggleIgnoreSkill(skillName, checkbox) {{
+  const row = checkbox.closest('.skill-row');
+  const name = row.getAttribute('data-name');
+  if (checkbox.checked) {{
+    ignoredSkills.add(name);
     row.classList.add('ignored');
   }} else {{
-    ignoredSkills.delete(skillName);
+    ignoredSkills.delete(name);
     row.classList.remove('ignored');
   }}
-  localStorage.setItem('affinda_ignored_skills', JSON.stringify(Array.from(ignoredSkills)));
+  localStorage.setItem('ats_ignored_skills', JSON.stringify([...ignoredSkills]));
   recalculateDelta();
 }}
 
 function resetIgnoredSkills() {{
-  ignoredSkills.clear();
-  localStorage.removeItem('affinda_ignored_skills');
+  localStorage.removeItem('ats_ignored_skills');
+  ignoredSkills = new Set();
   document.querySelectorAll('.skill-row').forEach(row => {{
     const chk = row.querySelector('.ignore-checkbox');
     if (row.classList.contains('noise-row')) {{
@@ -912,12 +1028,16 @@ function resetIgnoredSkills() {{
 }}
 
 function recalculateDelta() {{
-  let stats = {{
-    'ALL': {{ b_pts: 0, i_pts: 0, b_cnt: 0, i_cnt: 0 }},
-    'HARD_TECH': {{ b_pts: 0, i_pts: 0, b_cnt: 0, i_cnt: 0 }},
-    'QA_METHODOLOGY': {{ b_pts: 0, i_pts: 0, b_cnt: 0, i_cnt: 0 }},
-    'PROCESS_LEADERSHIP': {{ b_pts: 0, i_pts: 0, b_cnt: 0, i_cnt: 0 }}
-  }};
+  const allCatIds = new Set();
+  document.querySelectorAll('.skill-row').forEach(row => {{
+    const bCat = row.getAttribute('data-b-cat');
+    const iCat = row.getAttribute('data-i-cat');
+    if (bCat && bCat !== 'PARSER_NOISE') allCatIds.add(bCat);
+    if (iCat && iCat !== 'PARSER_NOISE') allCatIds.add(iCat);
+  }});
+  
+  let stats = {{ 'ALL': {{ b_pts: 0, i_pts: 0, b_cnt: 0, i_cnt: 0 }} }};
+  allCatIds.forEach(cid => {{ stats[cid] = {{ b_pts: 0, i_pts: 0, b_cnt: 0, i_cnt: 0 }}; }});
   let noiseStats = {{ b_cnt: 0, i_cnt: 0 }};
   
   document.querySelectorAll('.skill-row').forEach(row => {{
@@ -947,7 +1067,6 @@ function recalculateDelta() {{
     }}
   }});
   
-  // (improved - baseline) / baseline * 100%
   function getPct(b, i) {{
     if (b <= 0) return 0;
     return ((i - b) / b) * 100;
@@ -959,9 +1078,16 @@ function recalculateDelta() {{
   allEl.parentElement.style.color = allDelta >= 0 ? 'var(--green)' : 'var(--red)';
   document.getElementById('kpi-all-sub').innerText = `Baseline: ${{stats['ALL'].b_pts.toFixed(0)}} pts → Improved: ${{stats['ALL'].i_pts.toFixed(0)}} pts`;
 
-  updateCatDelta('hard', stats['HARD_TECH'], 'tools');
-  updateCatDelta('qa', stats['QA_METHODOLOGY'], 'practices');
-  updateCatDelta('proc', stats['PROCESS_LEADERSHIP'], 'skills');
+  allCatIds.forEach(cid => {{
+    const el = document.getElementById(`kpi-${{cid.toLowerCase()}}-val`);
+    if (el && stats[cid]) {{
+      const delta = getPct(stats[cid].b_pts, stats[cid].i_pts);
+      el.innerText = `${{delta >= 0 ? '+' : ''}}${{delta.toFixed(1)}}%`;
+      el.parentElement.style.color = delta >= 0 ? 'var(--green)' : 'var(--red)';
+      const subEl = document.getElementById(`kpi-${{cid.toLowerCase()}}-sub`);
+      if (subEl) subEl.innerText = `Baseline: ${{stats[cid].b_cnt}} skills → Improved: ${{stats[cid].i_cnt}} skills`;
+    }}
+  }});
 
   const noiseDelta = noiseStats.b_cnt > 0 ? (((noiseStats.i_cnt - noiseStats.b_cnt) / noiseStats.b_cnt) * 100) : 0;
   const noiseEl = document.getElementById('kpi-noise-val');
@@ -972,15 +1098,6 @@ function recalculateDelta() {{
   }}
 }}
 
-function updateCatDelta(prefix, catStat, unitName) {{
-  if (!catStat) return;
-  const delta = (catStat.b_pts > 0) ? (((catStat.i_pts - catStat.b_pts) / catStat.b_pts) * 100) : 0;
-  
-  const el = document.getElementById(`kpi-${{prefix}}-val`);
-  el.innerText = `${{delta >= 0 ? '+' : ''}}${{delta.toFixed(1)}}%`;
-  el.parentElement.style.color = delta >= 0 ? 'var(--green)' : 'var(--red)';
-  document.getElementById(`kpi-${{prefix}}-sub`).innerText = `Baseline: ${{catStat.b_cnt}} ${{unitName}} → Improved: ${{catStat.i_cnt}} ${{unitName}}`;
-}}
 
 function filterCategory(cat, btnEl) {{
   currentCategory = cat;
@@ -995,6 +1112,7 @@ function filterSkillSearch() {{
 }}
 
 function applyFilters() {{
+  let lessCount = 0, moreCount = 0, otherCount = 0;
   document.querySelectorAll('.skill-row').forEach(row => {{
     const rowCat = row.getAttribute('data-cat') || '';
     const rowName = row.getAttribute('data-name') || '';
@@ -1010,10 +1128,23 @@ function applyFilters() {{
     
     if (matchesCat && matchesSearch) {{
       row.style.display = '';
+      const table = row.closest('table');
+      if (table) {{
+        const tid = table.id;
+        if (tid === 'table-less') lessCount++;
+        else if (tid === 'table-more') moreCount++;
+        else if (tid === 'table-other') otherCount++;
+      }}
     }} else {{
       row.style.display = 'none';
     }}
   }});
+  const lessEl = document.getElementById('count-less');
+  const moreEl = document.getElementById('count-more');
+  const otherEl = document.getElementById('count-other');
+  if (lessEl) lessEl.innerText = lessCount;
+  if (moreEl) moreEl.innerText = moreCount;
+  if (otherEl) otherEl.innerText = otherCount;
 }}
 
 window.addEventListener('DOMContentLoaded', initIgnoredSkills);
@@ -1028,15 +1159,52 @@ window.addEventListener('DOMContentLoaded', initIgnoredSkills);
     print(f"✅ Generated percentage delta dashboard: {output_filepath}")
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="ATS Resume Comparison Dashboard — compare two resumes via Affinda + Gemini",
+        epilog="Examples:\n"
+               "  python3 generate_report.py --baseline 1AqF9... --improved 1TshO...\n"
+               "  python3 generate_report.py --baseline-file base.pdf --improved-file new.pdf\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--baseline", metavar="DOC_ID", help="Google Doc/Drive ID for the baseline resume")
+    parser.add_argument("--improved", metavar="DOC_ID", help="Google Doc/Drive ID for the improved resume")
+    parser.add_argument("--baseline-file", metavar="PATH", help="Local PDF path for the baseline resume")
+    parser.add_argument("--improved-file", metavar="PATH", help="Local PDF path for the improved resume")
+    parser.add_argument("-o", "--output", metavar="PATH", default=str(PROJECT_ROOT / "ats_comparison.html"),
+                        help="Output HTML path (default: ats_comparison.html)")
+    args = parser.parse_args()
+
+    # Resolve inputs: CLI args override hardcoded defaults
+    docs = {
+        "baseline": {"name": "Baseline Resume", "filename": "baseline_resume.pdf"},
+        "improved": {"name": "Improved Resume", "filename": "improved_resume.pdf"},
+    }
+
     print("🚀 FETCHING RESUMES & CHECKING AFFINDA HASH CACHE...")
     results = {}
-    for key, info in DOCS.items():
+
+    for key, label_flag, file_flag, default_id in [
+        ("baseline", args.baseline, args.baseline_file, DOCS["baseline"]["id"]),
+        ("improved", args.improved, args.improved_file, DOCS["improved"]["id"]),
+    ]:
+        info = docs[key]
         print(f"📥 Loading {info['name']}...")
-        pdf_bytes = fetch_pdf_bytes(info["id"])
+
+        if file_flag:
+            # Local PDF file
+            with open(file_flag, "rb") as f:
+                pdf_bytes = f.read()
+            info["filename"] = Path(file_flag).name
+            print(f"   📄 Loaded local file: {file_flag}")
+        else:
+            # Google Doc/Drive export
+            doc_id = label_flag or default_id
+            pdf_bytes = fetch_pdf_bytes(doc_id)
+
         results[key] = call_affinda_with_cache(pdf_bytes, info["filename"])
-        
-    out_html = PROJECT_ROOT / "ats_comparison.html"
-    generate_html_report(results["baseline"], results["improved"], str(out_html))
+
+    generate_html_report(results["baseline"], results["improved"], args.output)
 
 if __name__ == "__main__":
     main()
