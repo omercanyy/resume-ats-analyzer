@@ -1,0 +1,23 @@
+# Environment Secrets
+.env
+
+# Cache directories (Portable local caches)
+.cache/
+.affinda_cache/
+
+# Data, Taxonomy & Generated JSON Files
+*.json
+
+# Personal Resume Artifacts & HTML Outputs
+*.html
+*.pdf
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# OS Artifacts
+.DS_Store
+Thumbs.db
